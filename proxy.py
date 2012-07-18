@@ -87,7 +87,7 @@ class ProxyHandler(tornado.web.RequestHandler):
                 self.finish()
 
         assert self.request.path.startswith('/')
-        uri = "http://%s:%d%s" % (self.backend_connect_host,self.backend_port,self.request.path)
+        uri = "http://%s:%d%s?%s" % (self.backend_connect_host,self.backend_port,self.request.path,self.request.query)
         req = tornado.httpclient.HTTPRequest(url=uri,
             method=self.request.method, body=self.request.body,
             headers=self.request.headers, follow_redirects=False,
