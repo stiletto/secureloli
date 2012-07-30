@@ -38,33 +38,71 @@ import tornado.iostream
 import tornado.web
 import tornado.httpclient
 import httplib
+import datetime
+import time
+import traceback
+import logging
 
 from tornado.escape import utf8, _unicode, native_str
 from tornado.util import b
+from tornado.options import define, options, parse_command_line
 
 __all__ = ['ProxyHandler', 'run_proxy']
 
+class Stat(object):
+    proxy = 0
+    passthrough = 0
+    stat = 0
+    req = 0
+    start = datetime.datetime.utcnow()
+
+define("backend_host", type=str, default="bnw.im", help="Host header which will be sent to backend")
+define("backend_connect_host", type=str, default="127.0.0.1", help="Backend address (currently only one)")
+define("backend_port", type=int, default=80, help="Backend port")
+define("port", type=int, default=8443, help="Port to listen on")
+define("address", default="", help="Address to listen on")
+define("debug", type=bool, default=False, help="Enable debug messages")
 
 class ProxyHandler(tornado.web.RequestHandler):
     SUPPORTED_METHODS = ['GET', 'POST', 'HEAD'] #, 'CONNECT']
-    backend_host = 'bnw.im'
-    backend_connect_host = 'bnw.im'
-    backend_port = 80
-    debug = False
 
     @tornado.web.asynchronous
     def get(self):
+        Stat.req += 1
+        if self.request.path == '/secureloli/stat':
+            Stat.stat += 1
+            self.write('Active connections: %d <br/>\n' % (
+                Stat.proxy + Stat.passthrough + Stat.stat))
+            self.write('Proxy connections: %d <br/>\n' % Stat.proxy)
+            self.write('Passthrough connections: %d <br/>\n' % Stat.passthrough)
+            self.write('Statistics conenctions: %d <br/>\n' % Stat.stat)
+            self.write('Requests served: %d <br/>\n' % Stat.req)
+            uptime = datetime.datetime.utcnow() - Stat.start
+            days = uptime.days
+            hours = uptime.seconds / 3600
+            minutes = uptime.seconds / 60 % 60
+            seconds = uptime.seconds % 60
+            self.write('Uptime: %d days, %d:%02d:%02d <br/>\n' % (days,hours,minutes,seconds))
+            self.finish()
+            Stat.stat -= 1
+            return
         self.request.headers['X-Scheme'] = "https"
         self.request.headers['X-Forwarded-For'] = self.request.remote_ip
-        self.request.headers['Host'] = self.backend_host
+        self.request.headers['Host'] = options.backend_host
 
         connection = map(lambda s: s.strip().lower(), self.request.headers.get("Connection", "").split(","))
         #print connection,self.request.headers['Connection']
         if 'upgrade' in connection:
-            print 'PASS',self.request.remote_ip,self.request.path,self.request.headers['Connection']
-            return self.connect()
-        else:
-            print 'PROXY',self.request.remote_ip,self.request.path
+            logging.info('PASS %s %s %s',self.request.remote_ip,self.request.path,self.request.headers['Connection'])
+            try:
+                return self.connect()
+            except Exception:
+                logging.error(traceback.format_exc())
+                self.finish()
+
+        Stat.proxy += 1
+        stime = time.time()
+        logging.info('PROXY %s %s %s',id(self),self.request.remote_ip,self.request.path)
 
         def handle_response(response):
             self.set_header('Server','secureloli')
@@ -85,9 +123,14 @@ class ProxyHandler(tornado.web.RequestHandler):
                 if response.body:
                     self.write(response.body)
                 self.finish()
+            rtime = (time.time()-stime)
+            if rtime > 1.0:
+                logging.error(' vvv ALERT vvv')
+            logging.info('DONE %s %s %s %s %s',id(self),response.code,rtime,self.request.remote_ip,self.request.path)
+            Stat.proxy -= 1
 
         assert self.request.path.startswith('/')
-        uri = "http://%s:%d%s?%s" % (self.backend_connect_host,self.backend_port,self.request.path,self.request.query)
+        uri = "http://%s:%d%s?%s" % (options.backend_connect_host,options.backend_port,self.request.path,self.request.query)
         req = tornado.httpclient.HTTPRequest(url=uri,
             method=self.request.method, body=self.request.body,
             headers=self.request.headers, follow_redirects=False,
@@ -104,6 +147,7 @@ class ProxyHandler(tornado.web.RequestHandler):
                 self.set_status(500)
                 self.write('Internal server error:\n' + str(e))
                 self.finish()
+                Stat.proxy -= 1
 
     @tornado.web.asynchronous
     def post(self):
@@ -114,31 +158,41 @@ class ProxyHandler(tornado.web.RequestHandler):
         return self.get()
 
     def connect(self):
-        host, port = (self.backend_connect_host,self.backend_port)
+        self.active = True
+        host, port = (options.backend_connect_host,options.backend_port)
         client = self.request.connection.stream
+        Stat.passthrough += 1
 
         def read_from_client(data):
-            if self.debug:
-                print 'CLIENT >>', data
+            if options.debug:
+                logging.debug('CLIENT >> %s', data)
             upstream.write(data)
 
         def read_from_upstream(data):
-            if self.debug:
-                print 'UPSTREAM >>', data
+            if options.debug:
+                logging.debug('UPSTREAM >> %s', data)
             client.write(data)
 
         def client_close(_dummy):
-            if self.debug:
-                print 'CLIENTCLOSED',self.request.remote_ip,self.request.path
+            if options.debug:
+                logging.debug('CLIENTCLOSED %s %s',self.request.remote_ip,self.request.path)
+            if self.active:
+                Stat.passthrough -= 1
+                self.active = False
+                self.finish()
             upstream.close()
 
         def upstream_close(_dummy):
-            if self.debug:
-                print 'UPSTREAMCLOSED',self.request.remote_ip,self.request.path
+            if options.debug:
+                logging.debug('UPSTREAMCLOSED %s %s',self.request.remote_ip,self.request.path)
+            if self.active:
+                Stat.passthrough -= 1
+                self.active = False
+                self.finish()
             client.close()
 
         def start_tunnel():
-            print 'CONNECTED',self.request.remote_ip,self.request.path
+            logging.info('CONNECTED %s %s',self.request.remote_ip,self.request.path)
             client.read_until_close(client_close, read_from_client)
             upstream.read_until_close(upstream_close, read_from_upstream)
             upstream.write('%s %s %s\r\n' % (self.request.method, self.request.uri, self.request.version))
@@ -146,8 +200,8 @@ class ProxyHandler(tornado.web.RequestHandler):
                 line = utf8(k) + b(": ") + utf8(v)
                 if b('\n') in line:
                     raise ValueError('Newline in header: ' + repr(line)) # Fuck standards
-                if self.debug:
-                    print 'CLIENT >>>',line
+                if options.debug:
+                    logging.debug('CLIENT >>> %s',line)
                 upstream.write(line+'\r\n')
             upstream.write('\r\n')
             if self.request.body:
@@ -158,7 +212,7 @@ class ProxyHandler(tornado.web.RequestHandler):
         upstream.connect((host, int(port)), start_tunnel)
 
 
-def run_proxy(port, start_ioloop=True):
+def run_proxy(port, address="", start_ioloop=True):
     """
     Run proxy on the specified port. If start_ioloop is True (default),
     the tornado IOLoop will be started immediately.
@@ -166,15 +220,21 @@ def run_proxy(port, start_ioloop=True):
     app = tornado.web.Application([
         (r'.*', ProxyHandler),
     ])
-    app.listen(port,ssl_options={"certfile":"key.pem","keyfile":"key.pem"})
+    app.listen(port,address=address,ssl_options={"certfile":"key.pem","keyfile":"key.pem"})
     ioloop = tornado.ioloop.IOLoop.instance()
     if start_ioloop:
         ioloop.start()
 
 if __name__ == '__main__':
-    port = 8444
-    if len(sys.argv) > 1:
-        port = int(sys.argv[1])
+    parse_command_line()
 
-    print "Starting HTTP proxy on port %d" % port
-    run_proxy(port)
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    
+    hdlr = logging.FileHandler('secureloli.log')
+    formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(message)s')
+    hdlr.setFormatter(formatter)
+    logger.addHandler(hdlr) 
+
+    logging.info("Starting HTTP proxy on %s:%d" % (options.address, options.port))
+    run_proxy(options.port,options.address)
